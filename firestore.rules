@@ -1,0 +1,75 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function to check if the authenticated user is an admin
+    function isAdmin() {
+      return request.auth != null && 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    
+    // Helper function to check if the user is authenticated
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    match /users/{uid} {
+      // Owner or admin can read
+      allow read: if isAuth() && (request.auth.uid == uid || isAdmin());
+      
+      // On creation: Owner can create their doc but must be a 'customer'. Admin can create any.
+      allow create: if isAuth() && (
+        (request.auth.uid == uid && request.resource.data.role == 'customer') || 
+        isAdmin()
+      );
+      
+      // On update: Owner can update their doc but cannot alter their role. Admin can update anything.
+      allow update: if isAuth() && (
+        (request.auth.uid == uid && request.resource.data.role == resource.data.role) || 
+        isAdmin()
+      );
+      
+      allow delete: if isAdmin();
+    }
+
+    match /orders/{orderId} {
+      // Owner or admin can read
+      allow read: if isAuth() && (resource.data.uid == request.auth.uid || isAdmin());
+      
+      // Only authenticated owner can create (and uid must match their own)
+      allow create: if isAuth() && request.resource.data.uid == request.auth.uid;
+      
+      // Only admin can update or delete from the client.
+      // NOTE: Order delivery completion (status → 'delivered') is handled
+      //       server-side by the Cloud Function completeDeliveredOrders
+      //       (functions/index.js), which uses the Firebase Admin SDK.
+      //       The Admin SDK bypasses all Firestore security rules, so no
+      //       additional client-side update permission is needed here.
+      allow update, delete: if isAdmin();
+    }
+
+    match /config/{docId} {
+      // Any authenticated user can read config (pricing, inventory, etc.)
+      allow read: if isAuth();
+      // Only admin can write
+      allow write: if isAdmin();
+    }
+
+    match /coupons/{couponId} {
+      // Any authenticated user can read coupons
+      allow read: if isAuth();
+      // Only admin can write
+      allow write: if isAdmin();
+    }
+
+    match /logs/{logId} {
+      // Only admin can read logs
+      allow read: if isAdmin();
+      // Any authenticated user can create a log (append-only)
+      allow create: if isAuth();
+      // No one can update or delete logs once written
+      allow update, delete: if false; 
+    }
+  }
+}
