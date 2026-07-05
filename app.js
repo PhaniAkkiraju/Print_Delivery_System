@@ -179,7 +179,13 @@ function listenAll(userUid, isAdmin) {
       if (d.id === 'inventory') Object.assign(S.inventory, d.data());
       if (d.id === 'settings') {
         if (d.data().simSpeed)     S.simSpeed    = d.data().simSpeed;
-        if (d.data().supportAgent) S.supportAgent= d.data().supportAgent;
+        if (d.data().supportAgent) {
+          S.supportAgent = d.data().supportAgent;
+          const agentNameEl = $('support-agent-name');
+          if (agentNameEl) agentNameEl.textContent = `${S.supportAgent} (Support)`;
+          const bubbleEl = $('support-initial-bubble');
+          if (bubbleEl) bubbleEl.innerHTML = `Hello! I'm ${esc(S.supportAgent)}, your PrintIt support assistant. 🖨️🛵 How can I help you today?`;
+        }
       }
     });
   }, err => console.error('Config listener error:', err));
