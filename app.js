@@ -9,6 +9,14 @@
 /* ============================================================
    STATE
 ============================================================ */
+// ── Orders locally completed by THIS session ──────────────────────────────
+// The Cloud Function is the authoritative writer (status → 'delivered').
+// Until it fires (≤1 min), onSnapshot keeps returning status:'active' from
+// Firestore. Without this guard, every snapshot event would reset the local
+// order and trigger completeOrder again, creating an infinite loop that spams
+// renderOrders/onModalDelivered and breaks the order-card click handlers.
+const localDelivered = new Set();
+
 const S = {
   user:        null,       // {uid, username, email, role, joined, active}
   orders:      [],         // Synced via Firestore onSnapshot
@@ -142,6 +150,13 @@ function listenAll(userUid, isAdmin) {
 
   _unsubOrders = ordersQuery.onSnapshot(snap => {
     S.orders = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+    // Once Firestore confirms an order as delivered (Cloud Function wrote it),
+    // remove it from the local gate so timers won't linger unnecessarily.
+    S.orders.forEach(o => {
+      if (o.status === 'delivered' || o.status === 'cancelled') {
+        localDelivered.delete(o.id);
+      }
+    });
     resumeTimers();
     updateBadge();
     if ($('dashtab-my-orders')?.classList.contains('active')) renderOrders();
@@ -656,24 +671,16 @@ async function confirmPaymentAndPlaceOrder() {
 
   const payMethodLabels = { upi: '💳 UPI', card: '💳 Debit Card', cod: '💵 COD' };
 
-  // ── Upload PDF to Firebase Storage ────────────────────────
-  let fileUrl = '';
-  try {
-    const ref      = storage.ref(`pdfs/${S.user.uid}/${orderId}.pdf`);
-    const snapshot = await ref.put(S.currentFile);
-    fileUrl        = await snapshot.ref.getDownloadURL();
-    toast('📤 PDF uploaded to cloud', 'success');
-  } catch(err) {
-    console.warn('Storage upload failed (continuing without URL):', err);
-  }
+  // Save the current file reference before we clear it
+  const fileToUpload = S.currentFile;
 
   const order = {
     id:        orderId,
     uid:       S.user.uid || '',
     username:  S.user.username || 'user',
-    fileName:  S.currentFile.name,
-    fileSize:  fmtSize(S.currentFile.size),
-    fileUrl:   fileUrl,
+    fileName:  fileToUpload.name,
+    fileSize:  fmtSize(fileToUpload.size),
+    fileUrl:   '', // Will update after upload
     color:     S.opts.color,
     copies:    S.opts.copies,
     sides:     S.opts.sides,
@@ -699,22 +706,12 @@ async function confirmPaymentAndPlaceOrder() {
   if (order.binding === 'spiral') S.inventory.spirals.count    = Math.max(0, S.inventory.spirals.count    - order.copies);
   if (order.binding === 'book')   S.inventory.bookCovers.count = Math.max(0, S.inventory.bookCovers.count - order.copies);
 
-  // ── Write to Firestore ───────────────────────────────────
-  try {
-    await db.collection('orders').doc(orderId).set(order);
-    await fsWriteConfig('inventory', S.inventory);
-    await fsAddLog(`New order placed by ${order.username}: ${orderId} for ₹${order.price}`, 'success');
-    // Immediately add to local state so showTrackingModal works before onSnapshot fires
-    if (!S.orders.find(o => o.id === orderId)) {
-      S.orders.unshift(order);
-    }
-  } catch(err) {
-    console.error('Error writing order to Firestore:', err);
-    // Fallback: keep in local state so UI still works this session
+  // Immediately add to local state so showTrackingModal works before onSnapshot fires
+  if (!S.orders.find(o => o.id === orderId)) {
     S.orders.unshift(order);
-    toast('⚠️ Order placed but sync failed — check your connection.', 'error');
   }
 
+  // Reset UI state
   S.activeCoupon  = null;
   S.currentFile   = null;
   $('file-preview').classList.add('hidden');
@@ -723,11 +720,35 @@ async function confirmPaymentAndPlaceOrder() {
   if ($('num-copies')) $('num-copies').value = '1';
   S.opts.numPages = 1;
   S.opts.copies   = 1;
+  updateSummary();
 
   // Pass the full order object directly — no onSnapshot lookup needed
   startTimer(orderId);
   updateBadge();
   showTrackingModal(order);   // ← order object, always found
+
+  // ── Write to Firestore (Sync instantly) ──────────────────
+  try {
+    await db.collection('orders').doc(orderId).set(order);
+    await fsWriteConfig('inventory', S.inventory);
+    await fsAddLog(`New order placed by ${order.username}: ${orderId} for ₹${order.price}`, 'success');
+  } catch(err) {
+    console.error('Error writing order to Firestore:', err);
+    toast('⚠️ Order placed but sync failed — check your connection.', 'error');
+  }
+
+  // ── Upload PDF to Firebase Storage (Async) ───────────────
+  try {
+    const ref      = storage.ref(`pdfs/${S.user.uid}/${orderId}.pdf`);
+    const snapshot = await ref.put(fileToUpload);
+    const fileUrl  = await snapshot.ref.getDownloadURL();
+    toast('📤 PDF uploaded to cloud', 'success');
+    
+    // Update Firestore with the file URL so admin can download it
+    await db.collection('orders').doc(orderId).update({ fileUrl });
+  } catch(err) {
+    console.warn('Storage upload failed:', err);
+  }
 }
 
 /* ============================================================
@@ -762,6 +783,12 @@ function startTimer(id) {
 }
 
 function completeOrder(id) {
+  // ── One-shot gate ────────────────────────────────────────────────────────
+  // Prevents the onSnapshot → resumeTimers → completeOrder loop that occurs
+  // between this local update and the Cloud Function's authoritative write
+  // (≤1 min later). Without this, every Firestore snapshot resets the order
+  // to 'active' and triggers completeOrder again, breaking the UI.
+  if (localDelivered.has(id)) return;
   const order = S.orders.find(o => o.id === id);
   if (!order || order.status === 'delivered') return;
 
@@ -774,6 +801,7 @@ function completeOrder(id) {
   //
   // We mutate local state here only so the countdown / animations resolve
   // immediately in this browser tab — no Firestore write from the client.
+  localDelivered.add(id);
   order.status      = 'delivered';
   order.deliveredAt = Date.now();
   clearInterval(S.timers[id]); delete S.timers[id];
@@ -795,6 +823,9 @@ function refreshCardTimer(id, rem, pct) {
 
 function resumeTimers() {
   S.orders.forEach(o => {
+    // Skip orders already handled locally this session (avoids the
+    // onSnapshot-reset loop while Cloud Function hasn't written yet).
+    if (localDelivered.has(o.id)) return;
     if (o.status === 'active') {
       if (getRemaining(o) <= 0) completeOrder(o.id);
       else startTimer(o.id);
